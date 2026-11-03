@@ -70,7 +70,7 @@ jobs:
         run: pytest -q --cov=aigrid --cov-report=xml --cov-report=term-missing
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-xml
           path: coverage.xml
@@ -147,7 +147,7 @@ jobs:
           /tmp/venv/bin/pip install dist/*.whl
           /tmp/venv/bin/python -c "import aigrid, sys; print('aigrid', aigrid.__version__)"
           /tmp/venv/bin/aigrid-preflight --help
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
