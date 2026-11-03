@@ -50,6 +50,7 @@ from .preflight import (
     FT_API_USER_ENV,
     fetch_runtime_config,
 )
+from .service_lock import ServiceLock
 from .state.store import StateStore
 
 logger = logging.getLogger(__name__)
@@ -206,9 +207,28 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get(FT_API_URL_ENV, DEFAULT_API_URL),
         help=f"Freqtrade REST base URL (env {FT_API_URL_ENV}, default {DEFAULT_API_URL})",
     )
+    parser.add_argument("--lock-file", help="override the state directory service pidfile")
     args = parser.parse_args(argv)
 
     settings = load_settings(args.config)
+    lock = ServiceLock(
+        args.lock_file or Path(settings.state_dir or DEFAULT_STATE_DIR) / "aigrid-service.lock"
+    )
+    result = lock.acquire()
+    if result:
+        return result
+    try:
+        return _run_main(args, settings, lock)
+    finally:
+        try:
+            lock.release()
+        finally:
+            # Never orch.close(): persist() would write ft_integration.json.
+            if lock.eventlog is not None:
+                lock.eventlog.close()
+
+
+def _run_main(args, settings, lock: ServiceLock) -> int:
     exchange_info = None
     if settings.exchange_info_path:
         try:
@@ -223,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
             logger.warning("EXCHANGE_INFO_UNAVAILABLE: %s", exc)
             exchange_info = None
     orch = AIGridOrchestrator(settings, exchange_info=exchange_info)
+    lock.eventlog = getattr(orch, "eventlog", None)
+    lock.emit("SERVICE_LOCK_ACQUIRED")
     cycle = None
     if settings.mode == "dryrun":
         # R14 deterministic publish chain — closed candle -> regime ->
@@ -242,7 +264,6 @@ def main(argv: list[str] | None = None) -> int:
                 "aigrid.service: FT REST show_config unavailable (auth/URL?) — refusing to start",
                 file=sys.stderr,
             )
-            orch.eventlog.close()
             return 2
         watchlist = list(settings.watchlist or settings.symbols)
         runtime_watchlist = runtime.get("pair_whitelist")
@@ -336,14 +357,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise TypeError("approved config is not a JSON object")
         except Exception as exc:
             print(f"aigrid.service: cannot load preflight configs: {exc}", file=sys.stderr)
-            orch.eventlog.close()
             return 2
-    try:
-        return svc.run(runtime_cfg, approved_cfg)
-    finally:
-        # eventlog only — never orch.close(): persist() would write
-        # ft_integration.json, which this round must not produce.
-        orch.eventlog.close()
+    return svc.run(runtime_cfg, approved_cfg)
 
 
 if __name__ == "__main__":
