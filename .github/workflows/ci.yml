@@ -168,9 +168,12 @@ jobs:
           cache: pip
       - run: python -m pip install -e ".[dev]"
       - name: bandit
-        run: bandit -r aigrid -c pyproject.toml -f sarif -o bandit.sarif || true
+        run: |
+          python -m pip install "bandit[sarif]"
+          bandit -r aigrid -c pyproject.toml -f sarif -o bandit.sarif
       - name: Upload bandit SARIF
-        uses: github/codeql-action/upload-sarif@v3
+        if: ${{ hashFiles('bandit.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: bandit.sarif
       - name: gitleaks (committed secrets)
