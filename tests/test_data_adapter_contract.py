@@ -21,7 +21,6 @@ from datetime import UTC, datetime
 
 import pandas as pd
 import pytest
-
 from aigrid.data.binance_adapter import (
     TF_MS,
     BinanceFuturesDataAdapter,
