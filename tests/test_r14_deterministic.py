@@ -61,7 +61,7 @@ def _settings(**kw) -> AIGridSettings:
         "mode": "dryrun",
         "symbols": (PAIR,),
         "timeframe": "5m",
-        "data_dir": ROOT / "user_data/data/binance/futures",
+        "data_dir": ROOT / "tests/fixtures/synthetic-candles",
     }
     base.update(kw)
     return AIGridSettings(**base)
