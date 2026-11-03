@@ -18,6 +18,7 @@ import types
 from pathlib import Path
 
 import pytest
+from tests._attest import make_config, write_integration
 
 ROOT = Path(__file__).resolve().parents[1]
 STRATEGY_PATH = ROOT / "user_data/strategies/AIGridStrategy.py"
@@ -79,6 +80,9 @@ def strat_mod():
 
 def _strategy(strat_mod):
     s = object.__new__(strat_mod.AIGridStrategy)
+    s.config = make_config()
+    # These tests exercise the class timeframe when config has no override.
+    s.config.pop("timeframe")
     s._aigrid = {}
     s._plan = {}
     s._levels = []
@@ -97,10 +101,14 @@ def _write_integration(path: Path, plans: dict) -> None:
                 "mode": "dryrun",
                 "plans": plans,
                 "filled_levels": {},
+                "filled_level_prices": {p: [] for p in plans},
             }
         ),
         encoding="utf-8",
     )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    write_integration(path.parent, make_config(), **payload)
 
 
 def _entry_plan():
@@ -110,7 +118,10 @@ def _entry_plan():
         "grid_mode": "RANGE_GRID",
         "grid_upper": 110.0,
         "grid_lower": 90.0,
+        "grid_levels": 2,
         "grid_levels_prices": [98.0, 99.0],
+        "max_capital": 1000.0,
+        "max_position_size": 1000.0,
     }
 
 
@@ -146,7 +157,7 @@ def test_bot_start_config_timeframe_overrides_attr(strat_mod, wired):
     15m override must still halt even when the attribute says 5m."""
     s = _strategy(strat_mod)
     s.timeframe = "5m"
-    s.config = {"timeframe": "15m"}
+    s.config = make_config(timeframe="15m")
     s.bot_start()
     assert s._halted is True
 
@@ -154,7 +165,7 @@ def test_bot_start_config_timeframe_overrides_attr(strat_mod, wired):
 def test_bot_start_5m_runs_normally(strat_mod, wired):
     s = _strategy(strat_mod)
     s.timeframe = "5m"
-    s.config = {"timeframe": "5m"}
+    s.config = make_config()
     s.bot_start()
     assert s._halted is False
     assert s.confirm_trade_entry(PAIR, "limit", 1.0, 99.0, "GTC", None, None, "long") is True

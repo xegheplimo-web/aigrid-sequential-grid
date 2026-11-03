@@ -86,7 +86,10 @@ def test_get_ohlcv_candle_closes_before_asof_is_included(adapter):
     assert df.index.max() == pd.Timestamp("2026-10-11 06:00", tz="UTC")
     # One second earlier, that candle is still forming and must be excluded.
     df2 = adapter.get_ohlcv(
-        "ETH/USDT:USDT", "15m", as_of=datetime(2026, 10, 11, 6, 14, 59, tzinfo=UTC), lookback=10_000
+        "ETH/USDT:USDT",
+        "15m",
+        as_of=datetime(2026, 10, 11, 6, 14, 59, tzinfo=UTC),
+        lookback=10_000,
     )
     assert df2.index.max() == pd.Timestamp("2026-10-11 05:45", tz="UTC")
 

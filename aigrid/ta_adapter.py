@@ -120,7 +120,7 @@ class AICostLedger:
             "ai_failures": self.ai_failures,
             "ai_tokens_in": self.ai_tokens_in,
             "ai_tokens_out": self.ai_tokens_out,
-            "ai_seconds_total": round(self.ai_seconds_total, 3),
+            "ai_seconds_total": round(self.ai_seconds_total, 6),
         }
 
 
@@ -242,8 +242,8 @@ class TradingAgentsAdapter:
                     if env_file.exists():
                         load_dotenv(env_file, override=False)
                         break
-            except Exception as exc:  # .env is optional; a broken file must not disable the run
-                logger.debug("ignoring unreadable .env: %r", exc)
+            except Exception:
+                pass
         if key_env and not os.environ.get(key_env):
             self._init_error = f"MISSING_API_KEY:{key_env}"
             logger.warning("AI disabled: %s not set", key_env)

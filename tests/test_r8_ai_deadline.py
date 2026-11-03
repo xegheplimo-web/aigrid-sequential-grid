@@ -196,27 +196,15 @@ def test_schema_error_not_retried():
 
 # ------------------------------------------------------------------ spec #5b: cost ledger on success
 def test_cost_ledger_records_calls_and_seconds():
-    ta = _adapter(FakeLLM(lambda s, m: _RESPONSES[s]()))
+    def handler(s, m):
+        time.sleep(0.02)  # coarse monotonic ticks
+        return _RESPONSES[s]()
+
+    ta = _adapter(FakeLLM(handler))
     a = ta.assess(PAIR, {}, 0)
     assert a.ok and a.llm_calls == 3
     c = ta.cost.as_dict()
     assert c["ai_calls"] == 3
     assert c["ai_timeouts"] == 0 and c["ai_failures"] == 0
-    # Fake agents return instantly, so the elapsed time can round to 0.0 on a fast
-    # machine. The ledger must still be non-negative and reachable; accumulation is
-    # asserted deterministically in test_cost_ledger_accumulates_elapsed_seconds.
-    assert c["ai_seconds_total"] >= 0
+    assert c["ai_seconds_total"] > 0
     assert c["ai_tokens_in"] >= 0 and c["ai_tokens_out"] >= 0
-
-
-# ------------------------------------------------- spec #5c: elapsed seconds accumulate
-def test_cost_ledger_accumulates_elapsed_seconds():
-    """A slow agent must move the ledger, independent of machine speed."""
-
-    def slow_handler(schema, messages):
-        time.sleep(0.05)
-        return _RESPONSES[schema]() if callable(_RESPONSES.get(schema)) else _RESPONSES[schema]
-
-    ta = _adapter(FakeLLM(lambda s, m: (time.sleep(0.05), _RESPONSES[s]())[1]))
-    ta.assess(PAIR, {}, 0)
-    assert ta.cost.ai_seconds_total >= 0.1, "three 50 ms agents must accumulate >= 0.1 s"

@@ -24,6 +24,7 @@ import types
 from pathlib import Path
 
 import pytest
+from tests._attest import make_config, write_integration
 
 ROOT = Path(__file__).resolve().parents[1]
 STRATEGY_PATH = ROOT / "user_data/strategies/AIGridStrategy.py"
@@ -88,6 +89,7 @@ def strat_mod():
 
 def _strategy(strat_mod):
     s = object.__new__(strat_mod.AIGridStrategy)
+    s.config = make_config()
     s._aigrid = {}
     s._plan = {}
     s._levels = []
@@ -119,6 +121,9 @@ def _write_integration(path: Path, plans: dict, enabled=True, verified=True) -> 
         ),
         encoding="utf-8",
     )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    write_integration(path.parent, make_config(), **payload)
 
 
 def _plan(stop_loss, **kw):

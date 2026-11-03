@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -43,8 +44,14 @@ from .risk.engine import AccountState, RiskEngine
 from .risk.events import RiskEvent
 from .risk.ownership import OwnershipRegistry, OwnerState
 from .scheduler import AnalysisRequest, AnalysisScheduler, TriggerKind
-from .selection import PairSelector, ReferenceMarketGuard, ReferenceVerdict, SelectionResult
+from .selection import (
+    PairSelector,
+    ReferenceMarketGuard,
+    ReferenceVerdict,
+    SelectionResult,
+)
 from .settings import AIGridSettings
+from .state.ft_fills import FtFillsReader, filled_prices_for_pair
 from .state.reconcile import RestartReconciler
 from .state.store import EventLog, StateStore
 from .ta_adapter import MarketAssessment, TradingAgentsAdapter
@@ -89,7 +96,14 @@ class OrchestratorSnapshot:
 
 
 class AIGridOrchestrator:
-    def __init__(self, settings: AIGridSettings, *, exchange_info=None):
+    def __init__(
+        self,
+        settings: AIGridSettings,
+        *,
+        exchange_info=None,
+        ft_fills_reader=None,
+        ft_fills_deadline_s: float = 0.5,
+    ):
         self.settings = settings
         self.adapter = BinanceFuturesDataAdapter(settings.data_dir)
         self.ta = TradingAgentsAdapter(settings)
@@ -120,6 +134,18 @@ class AIGridOrchestrator:
             if exchange_info
             else None
         )
+        self._exchange_info = exchange_info
+        # R12: filled_level_prices is sourced ONLY from Freqtrade order state
+        # (GET /api/v1/status). Injectable for hermetic tests; production uses
+        # the same env credentials preflight does. The read runs on a single
+        # worker with a bounded join — the candle path never waits on a dead
+        # or slow REST endpoint (same pattern as the AI worker below).
+        self._ft_fills_reader = (
+            ft_fills_reader if ft_fills_reader is not None else FtFillsReader.from_env()
+        )
+        self._ft_fills_deadline_s = float(ft_fills_deadline_s)
+        self._fills_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aigrid-fills")
+        self._fills_future: Future | None = None
         # ---- multi-pair state
         self._engines: dict[str, VirtualGridEngine] = {}
         self._controllers: dict[str, RegimeController] = {}
@@ -139,6 +165,7 @@ class AIGridOrchestrator:
         self._ai_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aigrid-ai")
         self._ai_future: Future | None = None
         self._ai_down = False
+        self._sched_lock = threading.Lock()  # scheduler state touched by AI worker
         # preflight (T-205b): False until run_preflight() verifies the live
         # config against the approved one; drift sets _halted -> no entries.
         self.preflight_ok = False
@@ -229,7 +256,10 @@ class AIGridOrchestrator:
         # no per-pair snapshots -> run the global/legacy recovery path
         if not results:
             r = self.reconciler.recover(
-                actual_open_pairs, actual_open_order_ids, now_ms, actual_open_lots=actual_open_lots
+                actual_open_pairs,
+                actual_open_order_ids,
+                now_ms,
+                actual_open_lots=actual_open_lots,
             )
             if r.status == "RESTORED" and r.plan is not None:
                 self._engines[r.plan.symbol] = self._build_engine(
@@ -295,7 +325,11 @@ class AIGridOrchestrator:
         if isinstance(restored_lots, dict):
             for level_s, lot in restored_lots.items():
                 try:
-                    level, qty, entry = int(level_s), float(lot["qty"]), float(lot["entry"])
+                    level, qty, entry = (
+                        int(level_s),
+                        float(lot["qty"]),
+                        float(lot["entry"]),
+                    )
                 except (TypeError, ValueError, KeyError):
                     continue
                 engine.state.lots[level] = GridLot(
@@ -335,7 +369,10 @@ class AIGridOrchestrator:
         if plan.grid_mode == GridMode.SAFE_HOLD:
             return True
         ok, reason = self.ownership.acquire(
-            pair, "grid", f"grid:{plan.plan_id}", ts=datetime.now(UTC).isoformat()
+            pair,
+            "grid",
+            f"grid:{plan.plan_id}",
+            ts=datetime.now(UTC).isoformat(),
         )
         if not ok:
             self.eventlog.log(
@@ -374,8 +411,8 @@ class AIGridOrchestrator:
         External leases for pairs no longer reported open are released.
         Leases owned by "grid:*" (our own plans) are never taken or released.
         """
-        my_plan_ids = {e.plan.plan_id for e in self._engines.values()}
-        my_plan_ids.update(p.plan_id for p in self._pending.values())
+        my_plan_ids = {e.plan.plan_id for e in list(self._engines.values())}
+        my_plan_ids.update(p.plan_id for p in list(self._pending.values()))
         external_pairs: set[str] = set()
         ts = datetime.now(UTC).isoformat()
         for trade in open_trades or ():
@@ -467,7 +504,7 @@ class AIGridOrchestrator:
 
     def active_pairs(self) -> list[str]:
         """Pairs currently allowed to open new positions (active grid plans)."""
-        return [p for p, e in self._engines.items() if e.plan.grid_mode != GridMode.SAFE_HOLD]
+        return [p for p, e in list(self._engines.items()) if e.plan.grid_mode != GridMode.SAFE_HOLD]
 
     def analyze_candidates(self, trigger: TriggerKind, as_of: datetime | None = None) -> list[dict]:
         """One coordination cycle: scan -> analyze at most max_ai candidates."""
@@ -575,7 +612,11 @@ class AIGridOrchestrator:
 
     # ================================================================== AI cycle
     def run_analysis(
-        self, pair: str, trigger: TriggerKind, as_of: datetime | None = None, history_df=None
+        self,
+        pair: str,
+        trigger: TriggerKind,
+        as_of: datetime | None = None,
+        history_df=None,
     ) -> dict:
         """Dispatch one AI analysis cycle to the SLOW-AI worker thread.
 
@@ -589,10 +630,12 @@ class AIGridOrchestrator:
         if self._ai_future is not None and not self._ai_future.done():
             return {"dispatched": False, "reason": "AI_IN_FLIGHT"}
         req = _mk_request(pair, trigger, history_df)
-        ok, reason = self.scheduler.should_analyze(req)
+        with self._sched_lock:
+            ok, reason = self.scheduler.should_analyze(req)
+            if ok:
+                self.scheduler.record_dispatch(req)
         if not ok:
             return {"dispatched": False, "reason": reason}
-        self.scheduler.record_dispatch(req)
 
         if not self.settings.enabled:
             return {"dispatched": False, "reason": "AI_DISABLED"}
@@ -621,16 +664,21 @@ class AIGridOrchestrator:
             try:
                 snap = self.adapter.snapshot(pair, self.settings.timeframe, as_of=as_of)
             except Exception as exc:
-                self.scheduler.record_result(req, False, _elapsed(started), f"DATA:{exc}")
+                with self._sched_lock:
+                    self.scheduler.record_result(req, False, _elapsed(started), f"DATA:{exc}")
                 self.eventlog.log("AI_ANALYSIS_FAILED", pair, {"error": f"DATA:{exc}"})
                 self._ai_down = True
                 return {"ok": False, "error": f"DATA:{exc}"}
 
             assessment = self.ta.assess(pair, snap.to_ai_context(), snap.as_of_ms)
             latency = _elapsed(started)
-            self.scheduler.record_result(
-                req, assessment.ok, latency, "" if assessment.ok else assessment.reasoning_summary
-            )
+            with self._sched_lock:
+                self.scheduler.record_result(
+                    req,
+                    assessment.ok,
+                    latency,
+                    "" if assessment.ok else assessment.reasoning_summary,
+                )
             self._last_assessment = assessment
             self._last_analysis_ms = int(time.time() * 1000)
             if not assessment.ok:
@@ -660,9 +708,16 @@ class AIGridOrchestrator:
                 self.eventlog.log(
                     "PLAN_STALE_REJECTED",
                     pair,
-                    {"reason": "ANALYSIS_OVER_DEADLINE", "elapsed_ms": _elapsed(started)},
+                    {
+                        "reason": "ANALYSIS_OVER_DEADLINE",
+                        "elapsed_ms": _elapsed(started),
+                    },
                 )
-                return {"ok": False, "error": "PLAN_STALE_REJECTED", "latency_ms": latency}
+                return {
+                    "ok": False,
+                    "error": "PLAN_STALE_REJECTED",
+                    "latency_ms": latency,
+                }
 
             # --- reference guard: BTC/ETH dump vetoes alt LONG/RANGE grids
             verdict = self.check_reference(as_of)
@@ -676,14 +731,20 @@ class AIGridOrchestrator:
                         pair,
                         {"mode": grid_mode, "reasons": list(verdict.reasons)},
                     )
-                    return {"ok": False, "error": f"REFERENCE_VETO:{list(verdict.reasons)}"}
+                    return {
+                        "ok": False,
+                        "error": f"REFERENCE_VETO:{list(verdict.reasons)}",
+                    }
                 if grid_mode == "SHORT_GRID" and not verdict.alt_short_ok:
                     self.eventlog.log(
                         "REFERENCE_VETO",
                         pair,
                         {"mode": grid_mode, "reasons": list(verdict.reasons)},
                     )
-                    return {"ok": False, "error": f"REFERENCE_VETO:{list(verdict.reasons)}"}
+                    return {
+                        "ok": False,
+                        "error": f"REFERENCE_VETO:{list(verdict.reasons)}",
+                    }
 
             # --- active-pair cap (grid plans only; SAFE_HOLD always allowed)
             if (
@@ -692,7 +753,9 @@ class AIGridOrchestrator:
                 and len(self.active_pairs()) >= self.settings.selection.max_active_pairs
             ):
                 self.eventlog.log(
-                    "MAX_ACTIVE_PAIRS", pair, {"cap": self.settings.selection.max_active_pairs}
+                    "MAX_ACTIVE_PAIRS",
+                    pair,
+                    {"cap": self.settings.selection.max_active_pairs},
                 )
                 return {"ok": False, "error": "MAX_ACTIVE_PAIRS_REACHED"}
 
@@ -754,18 +817,33 @@ class AIGridOrchestrator:
                         pair,
                         {"reasons": list(verdict_v.reasons), "plan_id": plan.plan_id},
                     )
-                    return {"ok": False, "error": f"PLAN_REJECTED:{list(verdict_v.reasons)}"}
+                    return {
+                        "ok": False,
+                        "error": f"PLAN_REJECTED:{list(verdict_v.reasons)}",
+                    }
 
             # --- risk entry check (independent)
             decision = self.risk.evaluate_entry(plan, account, capital_manager=self.capital)
             if not decision.allowed:
                 self.eventlog.log(
-                    "PLAN_VETOED", pair, {"events": list(decision.events), "plan_id": plan.plan_id}
+                    "PLAN_VETOED",
+                    pair,
+                    {"events": list(decision.events), "plan_id": plan.plan_id},
                 )
                 return {"ok": False, "error": f"RISK_VETO:{list(decision.events)}"}
 
             # --- adopt (drain-then-switch)
             self.adopt_plan(plan)
+            self.eventlog.log(
+                "PLAN_ADOPTED",
+                pair,
+                {
+                    "plan_id": plan.plan_id,
+                    "mode": str(plan.grid_mode),
+                    "regime": plan.market_regime,
+                    "confidence": plan.confidence,
+                },
+            )
             self.eventlog.log(
                 "AI_ANALYSIS_COMPLETED",
                 pair,
@@ -786,7 +864,12 @@ class AIGridOrchestrator:
         except Exception as exc:
             logger.exception("AI pipeline crashed for %s", pair)
             self._ai_down = True
-            self.eventlog.log("AI_ANALYSIS_FAILED", pair, {"error": f"{type(exc).__name__}:{exc}"})
+            try:
+                self.eventlog.log(
+                    "AI_ANALYSIS_FAILED", pair, {"error": f"{type(exc).__name__}:{exc}"}
+                )
+            except Exception:
+                pass  # eventlog may already be closed
             return {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
 
     def adopt_plan(self, plan: AIGridPlan) -> None:
@@ -795,7 +878,9 @@ class AIGridOrchestrator:
             # a new plan would be published to the Freqtrade strategy and
             # could open entries — refuse while preflight-halted (T-205b)
             self.eventlog.log(
-                "PLAN_VETOED", plan.symbol, {"plan_id": plan.plan_id, "reason": "PREFLIGHT_DRIFT"}
+                "PLAN_VETOED",
+                plan.symbol,
+                {"plan_id": plan.plan_id, "reason": "PREFLIGHT_DRIFT"},
             )
             return
         pair = plan.symbol
@@ -805,7 +890,9 @@ class AIGridOrchestrator:
         else:
             self._pending[pair] = plan
             self.eventlog.log(
-                "PLAN_QUEUED", pair, {"plan_id": plan.plan_id, "waiting_drain": len(eng.state.lots)}
+                "PLAN_QUEUED",
+                pair,
+                {"plan_id": plan.plan_id, "waiting_drain": len(eng.state.lots)},
             )
 
     def _swap_engine(self, pair: str, plan: AIGridPlan) -> None:
@@ -843,9 +930,11 @@ class AIGridOrchestrator:
                 triggers.append(TriggerKind.VOLATILITY_SPIKE)
         for t in triggers:
             req = _mk_request(pair, t, history_df)
-            ok, _reason = self.scheduler.should_analyze(req)
+            with self._sched_lock:
+                ok, _reason = self.scheduler.should_analyze(req)
+                if ok:
+                    self.scheduler.record_dispatch(req)
             if ok:
-                self.scheduler.record_dispatch(req)
                 self.eventlog.log("EVENT_TRIGGER", pair, {"trigger": t.value})
 
     # ================================================================== snapshot
@@ -853,13 +942,14 @@ class AIGridOrchestrator:
         prices = prices or {}
         equity = 1000.0
         inventory = sum(
-            e.inventory_notional(prices.get(p, e.plan.grid_upper)) for p, e in self._engines.items()
+            e.inventory_notional(prices.get(p, e.plan.grid_upper))
+            for p, e in list(self._engines.items())
         )
         allocated: dict[str, float] = {}
-        for p, e in self._engines.items():
+        for p, e in list(self._engines.items()):
             if e.plan.grid_mode != GridMode.SAFE_HOLD:
                 allocated[p] = allocated.get(p, 0.0) + e.plan.max_capital
-        for p, pp in self._pending.items():
+        for p, pp in list(self._pending.items()):
             if pp.grid_mode != GridMode.SAFE_HOLD:
                 allocated[p] = allocated.get(p, 0.0) + pp.max_capital
         return AccountState(
@@ -890,7 +980,6 @@ class AIGridOrchestrator:
             else:
                 ai_status = "UNAVAILABLE"
         engine_dict = engine.to_dict(candle["close"]) if engine else {}
-        pending_plan = self._pending.get(pair)
         sel = self._last_selection
         return OrchestratorSnapshot(
             ts_ms=now_ms,
@@ -907,7 +996,7 @@ class AIGridOrchestrator:
             ai_reasoning=assessment.reasoning_summary if assessment else "",
             engine=engine_dict,
             risk_events=tuple(risk_events),
-            pending_plan_id=pending_plan.plan_id if pending_plan else None,
+            pending_plan_id=(self._pending.get(pair).plan_id if self._pending.get(pair) else None),
             selection={
                 "candidates": sel.top_pairs if sel else [],
                 "as_of_ms": sel.as_of_ms if sel else 0,
@@ -919,7 +1008,7 @@ class AIGridOrchestrator:
     # ================================================================== persistence
     def persist(self, snapshot: OrchestratorSnapshot | None = None) -> None:
         active = set()
-        for pair, engine in self._engines.items():
+        for pair, engine in list(self._engines.items()):
             stem = _stem(pair)
             active.add(stem)
             self.store.save_state(f"grid_state_{stem}", engine.to_dict(engine.plan.grid_upper))
@@ -954,8 +1043,21 @@ class AIGridOrchestrator:
             "mode": self.settings.mode,
             "plans": {},
             "filled_levels": {},
+            # filled_levels is the VIRTUAL candle-driven index book — kept
+            # for older consumers, never trusted as execution truth (R12).
+            "filled_levels_source": "virtual",
+            "reconciliation_state": "UNVERIFIED",
         }
-        for pair, engine in self._engines.items():
+        # R12: filled_level_prices is published ONLY from Freqtrade order
+        # state (one GET /api/v1/status per persist). REST down, unparseable
+        # or zero trades -> the key stays ABSENT and the strategy fails
+        # closed. engine.state.lots is never consulted as a fallback.
+        trades = self._fetch_ft_trades()
+        if trades:
+            payload["reconciliation_state"] = "VERIFIED"
+            payload["filled_level_prices"] = {}
+            payload["unmapped_orders"] = {}
+        for pair, engine in list(self._engines.items()):
             plan = engine.plan
             levels = plan.level_prices()
             n_levels = max(1, len(levels))
@@ -967,7 +1069,9 @@ class AIGridOrchestrator:
             if level_stake * len(levels) > plan.max_capital + 1e-6:
                 level_stake = plan.max_capital / n_levels
                 logger.warning(
-                    "level_stake over max_capital for %s; clamped to %.4f", pair, level_stake
+                    "level_stake over max_capital for %s; clamped to %.4f",
+                    pair,
+                    level_stake,
                 )
                 self.eventlog.log(
                     "LEVEL_STAKE_CLAMPED",
@@ -991,13 +1095,61 @@ class AIGridOrchestrator:
                 "expires_at": plan.expires_at.isoformat(),
             }
             payload["filled_levels"][pair] = sorted(engine.state.filled_levels)
+            if trades:
+                res = filled_prices_for_pair(
+                    trades,
+                    pair=pair,
+                    plan_id=plan.plan_id,
+                    level_prices=levels,
+                    price_tick=self._price_tick(pair),
+                )
+                payload["filled_level_prices"][pair] = res.prices
+                payload["unmapped_orders"][pair] = res.unmapped_orders
         self.store.save_state("ft_integration", payload)
+
+    def _fetch_ft_trades(self) -> list[dict] | None:
+        """GET /api/v1/status through the injected reader; None on ANY
+        failure — the caller omits filled_level_prices (fail-closed).
+
+        The read runs on a dedicated worker; this method joins it for at
+        most ``_ft_fills_deadline_s`` seconds (a dead local REST port can
+        cost seconds before the OS reports the refusal). A read still in
+        flight is left running — the next persist consumes it whenever it
+        lands, so at most one request is ever outstanding.
+        """
+        reader = self._ft_fills_reader
+        if reader is None or not self._engines:
+            return None
+        fut = self._fills_future
+        if fut is None or fut.done():
+            fut = self._fills_executor.submit(reader.fetch_open_trades)
+            self._fills_future = fut
+        try:
+            trades = fut.result(timeout=self._ft_fills_deadline_s)
+        except Exception as exc:
+            if not isinstance(exc, FutureTimeout):
+                logger.warning("FT fills read failed: %s", exc)
+            return None
+        return trades if isinstance(trades, list) else None
+
+    def _price_tick(self, pair: str) -> float | None:
+        """tickSize from the fapi_exchangeinfo snapshot; None -> the mapper
+        tightens to an exact (1e-9) match against the plan's level prices."""
+        ei = self._exchange_info
+        if ei is None:
+            return None
+        try:
+            tick = float(ei.rules_for(pair).tick_size)
+        except Exception:
+            return None
+        return tick if tick > 0 else None
 
     def close(self, ai_join_timeout: float = 5.0) -> None:
         """Stop: join the AI worker for at most ai_join_timeout seconds —
         shutdown must never hang on a stuck LLM call (SIGTERM path)."""
         self._shutdown_ai(ai_join_timeout)
         self.persist()
+        self._fills_executor.shutdown(wait=False, cancel_futures=True)
         self.eventlog.close()
 
     def _shutdown_ai(self, timeout_s: float) -> None:
@@ -1006,8 +1158,8 @@ class AIGridOrchestrator:
         if fut is not None and not fut.done():
             try:
                 fut.result(timeout=timeout_s)
-            except Exception as exc:  # bounded join: never hang on shutdown
-                logger.debug("AI worker did not finish within %.1fs: %r", timeout_s, exc)
+            except Exception:
+                pass  # bounded join; never hang
 
 
 def _mk_request(pair: str, trigger: TriggerKind, history_df) -> AnalysisRequest:

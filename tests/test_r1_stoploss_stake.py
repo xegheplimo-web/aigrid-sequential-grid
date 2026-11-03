@@ -20,6 +20,7 @@ import pytest
 from aigrid.orchestrator import AIGridOrchestrator
 from aigrid.plans.schema import AIGridPlan, GridMode, draft_plan_from_assessment
 from aigrid.settings import AIGridSettings
+from tests._attest import make_config, write_integration
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "user_data/data/binance/futures"
@@ -88,6 +89,7 @@ def strat_mod():
 def _strategy(strat_mod):
     """Bare strategy instance — __init__ only sets attrs, no freqtrade needed."""
     s = object.__new__(strat_mod.AIGridStrategy)
+    s.config = make_config()
     s._aigrid = {}
     s._plan = {}
     s._levels = []
@@ -110,10 +112,14 @@ def _write_integration(path: Path, plans: dict, enabled=True, verified=True) -> 
                 "mode": "dryrun",
                 "plans": plans,
                 "filled_levels": {},
+                "filled_level_prices": {p: [] for p in plans},
             }
         ),
         encoding="utf-8",
     )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    write_integration(path.parent, make_config(), **payload)
 
 
 # ====================================================================== T-201: stoploss
@@ -327,7 +333,10 @@ def test_custom_stake_amount_returns_plan_margin(strat_mod, monkeypatch, tmp_pat
                 "level_stake": 20.0,
                 "stop_loss": 97.0,
                 "grid_mode": "RANGE_GRID",
+                "grid_levels": 2,
                 "grid_levels_prices": [98.0, 99.0],
+                "max_capital": 1000.0,
+                "max_position_size": 1000.0,
             }
         },
     )

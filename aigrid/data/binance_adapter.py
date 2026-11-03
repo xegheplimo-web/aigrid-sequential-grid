@@ -242,10 +242,7 @@ class BinanceFuturesDataAdapter:
             raise ValueError("limit out of bounds")
         url = f"{PUBLIC_KLINES_URL}?symbol={pair_to_rest_symbol(pair)}&interval={tf}&limit={limit}"
         req = urllib.request.Request(url, headers={"User-Agent": "AIGrid-Research/0.1"})
-        # The URL is built from the pinned HTTPS public-klines constant above.
-        with urllib.request.urlopen(  # nosec B310
-            req, timeout=self.rest_timeout
-        ) as resp:
+        with urllib.request.urlopen(req, timeout=self.rest_timeout) as resp:
             rows = json.load(resp)
         now_ms = int(time.time() * 1000)
         out = []
