@@ -14,9 +14,13 @@ pre-commit install --hook-type pre-commit --hook-type pre-push
 pytest -q
 ```
 
-The hermetic suite must pass in ~3 seconds without network access. If your change
-needs market data, use `scripts/fetch_fixtures.py` and keep the test skip-gated so
-CI without fixtures stays green.
+The hermetic suite must pass in ~3 seconds without network access. Tests that
+replay recorded candles or the recorded exchange-info snapshot live in the
+**replay tier** and are skipped unless `AIGRID_FULL_FIXTURES=1` is set — those
+recordings are not published, so do not add new tests that depend on them
+without a hermetic fallback. If your change needs market data, use
+`scripts/fetch_fixtures.py` (public endpoint, no key) and keep tests skip-gated
+so CI without fixtures stays green.
 
 ## The bar for a change
 
