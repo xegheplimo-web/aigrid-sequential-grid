@@ -40,7 +40,8 @@ from pathlib import Path
 
 FT_API_URL_ENV = "FT_API_URL"
 FT_API_USER_ENV = "FT_API_USER"
-FT_API_PASS_ENV = "FT_API_PASS"  # nosec B105 - env var *name*, never a secret value
+# Environment variable *names* only; this module never stores a credential value.
+FT_API_PASS_ENV = "FT_API_PASS"  # nosec B105
 APPROVED_CONFIG_ENV = "AIGRID_APPROVED_CONFIG"
 DEFAULT_API_URL = "http://127.0.0.1:8080"
 DEFAULT_TIMEOUT_S = 10.0
@@ -239,7 +240,8 @@ def _get_json(url: str, username: str | None, password: str | None, timeout: flo
     if username:
         token = base64.b64encode(f"{username}:{password or ''}".encode()).decode()
         req.add_header("Authorization", f"Basic {token}")
-    with urllib.request.urlopen(  # nosec B310 - scheme restricted to http/https above
+    # Only http/https survive the scheme check above.
+    with urllib.request.urlopen(  # nosec B310
         req, timeout=timeout
     ) as resp:
         return json.loads(resp.read().decode("utf-8"))

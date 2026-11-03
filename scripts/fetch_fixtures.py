@@ -59,7 +59,8 @@ def _request(symbol: str, interval: str, limit: int, end_time: int | None) -> li
     req = urllib.request.Request(
         f"{KLINE_URL}?{params}", headers={"User-Agent": "aigrid-fixtures/1.0"}
     )
-    with urllib.request.urlopen(  # nosec B310 - KLINE_URL is a pinned HTTPS constant
+    # KLINE_URL is a pinned HTTPS constant; no caller-supplied scheme reaches here.
+    with urllib.request.urlopen(  # nosec B310
         req, timeout=30
     ) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
