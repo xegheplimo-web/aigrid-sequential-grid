@@ -1006,8 +1006,8 @@ class AIGridOrchestrator:
         if fut is not None and not fut.done():
             try:
                 fut.result(timeout=timeout_s)
-            except Exception:
-                pass  # bounded join; never hang
+            except Exception as exc:  # bounded join: never hang on shutdown
+                logger.debug("AI worker did not finish within %.1fs: %r", timeout_s, exc)
 
 
 def _mk_request(pair: str, trigger: TriggerKind, history_df) -> AnalysisRequest:

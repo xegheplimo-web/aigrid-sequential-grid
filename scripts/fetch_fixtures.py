@@ -59,7 +59,9 @@ def _request(symbol: str, interval: str, limit: int, end_time: int | None) -> li
     req = urllib.request.Request(
         f"{KLINE_URL}?{params}", headers={"User-Agent": "aigrid-fixtures/1.0"}
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(  # nosec B310 - KLINE_URL is a pinned HTTPS constant
+        req, timeout=30
+    ) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     if not isinstance(payload, list):
         raise RuntimeError(f"Unexpected klines payload for {symbol}: {payload!r}")
