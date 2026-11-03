@@ -1,0 +1,126 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aigrid-sequential-grid"
+version = "0.1.0"
+description = "Deterministic sequential grid engine for crypto futures with a hard-risk veto layer and validated AI plans."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "DuyAI", email = "xegheplimo-web@users.noreply.github.com" }]
+keywords = ["grid-trading", "futures", "quant", "risk-management", "backtesting", "freqtrade"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Financial and Insurance Industry",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Office/Business :: Financial :: Investment",
+  "Typing :: Typed",
+]
+dependencies = [
+  "pandas>=2.1",
+  "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dashboard = ["fastapi>=0.110", "uvicorn>=0.29"]
+freqtrade = ["freqtrade>=2024.5", "ta-lib>=0.4.28"]
+dev = [
+  "pyarrow>=15.0",
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "pytest-timeout>=2.3",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "bandit>=1.7",
+  "build>=1.2",
+  "twine>=5.0",
+  "pre-commit>=3.7",
+]
+
+[project.scripts]
+aigrid-preflight = "aigrid.preflight:main"
+
+[project.urls]
+Homepage = "https://github.com/xegheplimo-web/aigrid-sequential-grid"
+Documentation = "https://github.com/xegheplimo-web/aigrid-sequential-grid/tree/main/docs"
+Issues = "https://github.com/xegheplimo-web/aigrid-sequential-grid/issues"
+Changelog = "https://github.com/xegheplimo-web/aigrid-sequential-grid/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aigrid"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+timeout = 120
+markers = [
+  "slow: long-running replay/backtest tests",
+  "requires_data: needs recorded Binance futures fixtures (see scripts/fetch_fixtures.py)",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["aigrid"]
+omit = ["aigrid/dashboard_server.py", "aigrid/dashboard_api.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["aigrid", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RET", "PTH", "TID", "RUF"]
+ignore = [
+  "E501",   # long lines are handled by the formatter
+  "B008",   # function calls in argument defaults are intentional (dataclass-style defaults)
+  "RUF001", # ambiguous unicode (Vietnamese/typographic quotes in docstrings)
+  "RUF002",
+  "RUF003",
+  # Deliberate style choices in this codebase, not defects:
+  "C408",   # explicit dict()/list() calls used for readability in fixtures
+  "C416",   # comprehensions kept for symmetry with the enclosing expression
+  "TID252", # intra-package relative imports
+  "E741",   # short math-style names (l, O) mirror the trading literature
+  "SIM102", "SIM103", "SIM105", "SIM108",  # guard-heavy code prefers explicit branches
+  "N818",   # exception names follow domain vocabulary (e.g. GridHalted)
+  "PTH105", "PTH123",  # os.replace/open used deliberately for atomic-write semantics
+  "RET504", "RUF015", "B007", "RUF059",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "SIM117", "B011", "B017", "F841"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["aigrid"]
+ignore_missing_imports = true
+warn_unused_ignores = false
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+disallow_untyped_defs = false
+files = ["aigrid"]
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", "build", "dist"]
+skips = ["B101"]
+
+[tool.bandit.assert_used]
+skips = ["*/test_*.py"]

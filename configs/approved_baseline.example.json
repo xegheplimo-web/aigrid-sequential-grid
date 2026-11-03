@@ -1,0 +1,22 @@
+{
+  "_comment": "Example reviewed baseline for `aigrid-preflight`. Copy to a private location, review every value against what you intend the bot to run, then point AIGRID_APPROVED_CONFIG at your copy. Preflight is read-only: it never changes the running bot.",
+  "_meta": {
+    "reviewed_by": "REPLACE-ME (must be a human who owns the account)",
+    "reviewed_at": "2026-01-01T00:00:00+00:00",
+    "note": "max_entry_position_adjustment=-1 is required for multi-level grids; it is acceptable only because CapitalManager.max_position_size and the risk engine cap the resulting exposure in money terms. leverage is not exposed by the runtime API: 1x is asserted by policy and must be re-verified as trade.leverage == 1.0 at the first fill."
+  },
+  "strategy": "AIGridStrategy",
+  "dry_run": true,
+  "trading_mode": "futures",
+  "timeframe": "5m",
+  "pair_whitelist": [
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "DOGE/USDT:USDT"
+  ],
+  "stake_amount": 40,
+  "max_open_trades": 3,
+  "max_entry_position_adjustment": -1,
+  "leverage": 1.0,
+  "stoploss": -0.1
+}
