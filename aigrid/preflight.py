@@ -30,9 +30,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import sys
+import tempfile
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -40,11 +45,103 @@ from pathlib import Path
 
 FT_API_URL_ENV = "FT_API_URL"
 FT_API_USER_ENV = "FT_API_USER"
-# Environment variable *names* only; this module never stores a credential value.
-FT_API_PASS_ENV = "FT_API_PASS"  # nosec B105
+FT_API_PASS_ENV = "FT_API_PASS"  # nosec B105 -- environment variable name only
 APPROVED_CONFIG_ENV = "AIGRID_APPROVED_CONFIG"
 DEFAULT_API_URL = "http://127.0.0.1:8080"
 DEFAULT_TIMEOUT_S = 10.0
+DEFAULT_INTEGRATION_PATH = Path("user_data/aigrid_state/ft_integration.json")
+
+
+def canonical_json(value: dict) -> bytes:
+    """One UTF-8 wire representation for both signer and verifier."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def config_hash(config: dict) -> str:
+    """Hash only the six REST-visible fields (D-101).
+
+    REST serializes stake_amount as a string; normalize numeric fields on
+    both sides so the same effective runtime has the same fingerprint.
+    Missing fields are rejected rather than signed as evidence.
+    """
+    fields = {
+        key: config[key]
+        for key in (
+            "strategy",
+            "dry_run",
+            "trading_mode",
+            "stake_amount",
+            "max_open_trades",
+        )
+    }
+    for key in ("stake_amount", "max_open_trades"):
+        try:
+            fields[key] = float(fields[key])
+        except (ValueError, TypeError):
+            pass
+    exchange = config.get("exchange")
+    pairs = exchange.get("pair_whitelist") if isinstance(exchange, dict) else None
+    if pairs is None:
+        pairs = config["pair_whitelist"]
+    if not isinstance(pairs, list) or not all(isinstance(p, str) for p in pairs):
+        raise ValueError("invalid runtime whitelist")
+    fields["exchange"] = {"pair_whitelist": sorted(pairs)}
+    return hashlib.sha256(canonical_json(fields)).hexdigest()
+
+
+def get_attestation_secret(path: Path) -> bytes:
+    """Create once with exclusive open, then read; never replace a bad key."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(secrets.token_bytes(32))
+    secret = path.read_bytes()
+    if len(secret) != 32:
+        raise ValueError("invalid attestation secret length")
+    return secret
+
+
+def write_attestation(runtime: dict, integration_path: Path) -> dict:
+    """Add evidence without ever granting permission to trade.
+
+    Caller must first obtain successful REST show_config and health replies.
+    An atomic replace prevents readers from observing a partial signature.
+    """
+    block = {
+        "ts_ms": int(time.time() * 1000),
+        "nonce": secrets.token_hex(4),
+        "container_id": os.environ.get("HOSTNAME", ""),
+        "config_hash": config_hash(runtime),
+    }
+    secret = get_attestation_secret(integration_path.parent / ".attest_secret")
+    block["sig"] = hmac.new(secret, canonical_json(block), hashlib.sha256).hexdigest()
+    try:
+        data = json.loads(integration_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        data = {"enabled": False}
+    if not isinstance(data, dict):
+        raise TypeError("integration must be an object")
+    data["attestation"] = block
+    fd, name = tempfile.mkstemp(dir=integration_path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, allow_nan=False)
+        os.replace(name, integration_path)
+    finally:
+        if Path(name).exists():
+            Path(name).unlink()
+    return block
+
 
 _DRIFT_KEYS = (
     "timeframe",
@@ -240,10 +337,7 @@ def _get_json(url: str, username: str | None, password: str | None, timeout: flo
     if username:
         token = base64.b64encode(f"{username}:{password or ''}".encode()).decode()
         req.add_header("Authorization", f"Basic {token}")
-    # Only http/https survive the scheme check above.
-    with urllib.request.urlopen(  # nosec B310
-        req, timeout=timeout
-    ) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- HTTP(S) checked above
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -252,6 +346,8 @@ def fetch_runtime_config(
     username: str | None = None,
     password: str | None = None,
     timeout: float = DEFAULT_TIMEOUT_S,
+    *,
+    integration_path: Path | None = None,
 ) -> dict:
     """Read the live runtime config from the Freqtrade REST API.
 
@@ -260,10 +356,19 @@ def fetch_runtime_config(
     """
     base = base_url.rstrip("/")
     cfg = _get_json(f"{base}/api/v1/show_config", username, password, timeout)
+    health = _get_json(f"{base}/api/v1/health", username, password, timeout)
+    if not isinstance(cfg, dict) or not cfg or not isinstance(health, dict) or not health:
+        raise ValueError("invalid REST config/health response")
     wl = _get_json(f"{base}/api/v1/whitelist", username, password, timeout)
     runtime = dict(cfg)
     whitelist = wl.get("whitelist", wl) if isinstance(wl, dict) else wl
     runtime["pair_whitelist"] = list(whitelist or [])
+    path = (
+        integration_path
+        if integration_path is not None
+        else Path(os.environ.get("AIGRID_INTEGRATION_FILE", str(DEFAULT_INTEGRATION_PATH)))
+    )
+    write_attestation(runtime, path)
     return runtime
 
 
@@ -296,14 +401,14 @@ def main(argv: list[str] | None = None) -> int:
             username=os.environ.get(FT_API_USER_ENV),
             password=os.environ.get(FT_API_PASS_ENV),
         )
-    except Exception as exc:
+    except (OSError, ValueError, TypeError, KeyError) as exc:
         print(f"preflight: cannot read runtime config: {exc}", file=sys.stderr)
         return 2
     try:
         approved = json.loads(Path(args.approved).read_text(encoding="utf-8"))
         if not isinstance(approved, dict):
-            raise ValueError("approved config is not a JSON object")
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise TypeError("approved config is not a JSON object")
+    except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
         print(f"preflight: cannot read approved config: {exc}", file=sys.stderr)
         return 2
     for warning in check_telegram_and_safety(runtime):

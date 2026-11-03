@@ -12,11 +12,16 @@ A long-running supervisor around the orchestrator:
 - restart keeps state: aigrid_state/ is never wiped; the previous
   heartbeat is read back and resumed_from_cycle is logged
 
-This round is heartbeat-only by design: the loop NEVER writes
-ft_integration.json — it does not call orchestrator.persist() or
-_write_ft_integration(), and it never dispatches entries or publishes
-plans. With settings.enabled=false (the aigrid.toml default) it runs in
-SHADOW_MODE: loop + heartbeat, no entry, no publish.
+In non-dryrun modes the loop is heartbeat-only by design: it NEVER
+writes ft_integration.json itself. When ``settings.mode == "dryrun"``
+and a DeterministicCycle is injected, each tick additionally runs the
+R14 deterministic chain — closed-candle detect -> process_candle ->
+REGIME check -> deterministic plan -> guarded atomic publish (tmp +
+os.replace). That path has NO LLM call and no non-local network call
+beyond the read-only Freqtrade REST GETs; a blocked guard writes
+nothing and emits PUBLISH_BLOCKED. With settings.enabled=false (the
+aigrid.toml default) it runs in SHADOW_MODE regardless: loop +
+heartbeat, no entry, no publish.
 """
 
 from __future__ import annotations
@@ -33,6 +38,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .config import load_settings
+from .data.binance_adapter import TF_MS
+from .exchange_info import ExchangeInfo
 from .orchestrator import AIGridOrchestrator
 from .preflight import (
     APPROVED_CONFIG_ENV,
@@ -42,7 +50,6 @@ from .preflight import (
     FT_API_USER_ENV,
     fetch_runtime_config,
 )
-from .settings import load_settings
 from .state.store import StateStore
 
 logger = logging.getLogger(__name__)
@@ -57,6 +64,8 @@ class AIGridService:
 
     clock: callable returning seconds (time.time-compatible); injected in
     tests. on_cycle: optional callback invoked after each heartbeat tick.
+    cycle: optional DeterministicCycle — driven once per tick ONLY when
+    settings.mode == "dryrun"; ignored in every other mode.
     """
 
     def __init__(
@@ -66,11 +75,13 @@ class AIGridService:
         *,
         clock: Callable[[], float] | None = None,
         on_cycle: Callable[[int], None] | None = None,
+        cycle: Any = None,
     ):
         self.orchestrator = orchestrator
         self.interval_s = float(interval_s)
         self._clock = clock or time.time
         self.on_cycle = on_cycle
+        self._cycle = cycle
         self._stop = threading.Event()
         state_dir = (
             getattr(getattr(orchestrator, "settings", None), "state_dir", None) or DEFAULT_STATE_DIR
@@ -91,6 +102,11 @@ class AIGridService:
         logger.info("%s %s", kind, payload)
 
     def _write_heartbeat(self, cycle: int, *, stopped: bool, preflight_ok: bool) -> None:
+        processed = (
+            dict(getattr(self._cycle, "processed_ts", self._cycle.seen_ts))
+            if self._cycle is not None
+            else {}
+        )
         self._store.save_state(
             "heartbeat",
             {
@@ -99,9 +115,14 @@ class AIGridService:
                 "pid": os.getpid(),
                 "preflight_ok": bool(preflight_ok),
                 "stopped": bool(stopped),
+                # newest closed-candle open_ms per pair loaded this pass
+                "candle_ts_ms": processed,
+                "watchlist": list(processed),
             },
         )
 
+    # Controller unlock needs >=3 closed candles in the same regime; run the
+    # service continuously for >=15 minutes before the first publish.
     # ------------------------------------------------------------------ main loop
     def run(self, runtime_cfg: dict | None = None, approved_cfg: dict | None = None) -> int:
         """0 = clean stop; 2 = preflight blocked (drift or unverifiable)."""
@@ -122,12 +143,31 @@ class AIGridService:
             if check.blocked:
                 self._log(
                     "SERVICE_PREFLIGHT_BLOCKED",
-                    {"drift": list(check.drift), "unverifiable": list(check.unverifiable)},
+                    {
+                        "drift": list(check.drift),
+                        "unverifiable": list(check.unverifiable),
+                    },
                 )
                 self._write_heartbeat(cycle, stopped=True, preflight_ok=False)
                 return 2
+        # R14: the deterministic publish cycle runs ONLY in dryrun mode.
+        dryrun_cycle = self._cycle if getattr(settings, "mode", "off") == "dryrun" else None
+        if dryrun_cycle is not None:
+            # D-102 (1): reconcile persisted state before ANY publish.
+            try:
+                dryrun_cycle.startup_reconcile()
+            except Exception as exc:
+                self._log(
+                    "STARTUP_RECONCILIATION_ERROR",
+                    {"error": f"{type(exc).__name__}:{exc}"},
+                )
         while not self._stop.is_set():
             cycle += 1
+            if dryrun_cycle is not None:
+                try:
+                    dryrun_cycle.tick(cycle)
+                except Exception as exc:
+                    self._log("CYCLE_TICK_ERROR", {"error": f"{type(exc).__name__}:{exc}"})
             self._write_heartbeat(cycle, stopped=False, preflight_ok=preflight_ok)
             if self.on_cycle is not None:
                 self.on_cycle(cycle)
@@ -140,8 +180,9 @@ class AIGridService:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="aigrid.service",
-        description="AIGrid shadow service: startup preflight + heartbeat "
-        "loop. Never publishes ft_integration.json.",
+        description="AIGrid service: startup preflight + heartbeat loop; "
+        "in dryrun mode also runs the deterministic "
+        "closed-candle -> plan -> guarded atomic publish cycle.",
     )
     parser.add_argument(
         "--config",
@@ -149,7 +190,10 @@ def main(argv: list[str] | None = None) -> int:
         help=f"AIGrid TOML path (default {DEFAULT_CONFIG_PATH})",
     )
     parser.add_argument(
-        "--interval", type=float, default=30.0, help="seconds between heartbeat ticks (default 30)"
+        "--interval",
+        type=float,
+        default=30.0,
+        help="seconds between heartbeat ticks (default 30)",
     )
     parser.add_argument(
         "--approved",
@@ -165,10 +209,115 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = load_settings(args.config)
-    orch = AIGridOrchestrator(settings)
-    svc = AIGridService(orch, interval_s=args.interval)
+    exchange_info = None
+    if settings.exchange_info_path:
+        try:
+            exchange_info = ExchangeInfo(settings.exchange_info_path)
+            if not exchange_info._rules:
+                raise ValueError("snapshot has no tradable USDT perpetual symbols")
+            for pair in settings.watchlist:
+                rules = exchange_info.rules_for(pair)
+                if rules.tick_size <= 0 or rules.step_size <= 0:
+                    raise ValueError(f"invalid exchange filters for {pair}")
+        except Exception as exc:
+            logger.warning("EXCHANGE_INFO_UNAVAILABLE: %s", exc)
+            exchange_info = None
+    orch = AIGridOrchestrator(settings, exchange_info=exchange_info)
+    cycle = None
+    if settings.mode == "dryrun":
+        # R14 deterministic publish chain — closed candle -> regime ->
+        # plan -> guarded atomic publish. No LLM; the only network is the
+        # read-only local Freqtrade REST (facts for the guards).
+        from .publish import DeterministicCycle, FtRestClient, PlanPublisher
+
+        client = FtRestClient(
+            args.api_url,
+            username=os.environ.get(FT_API_USER_ENV),
+            password=os.environ.get(FT_API_PASS_ENV),
+        )
+        logger.info("FT REST base URL: %s", args.api_url)
+        runtime = client.show_config()
+        if not runtime:
+            print(
+                "aigrid.service: FT REST show_config unavailable (auth/URL?) — refusing to start",
+                file=sys.stderr,
+            )
+            orch.eventlog.close()
+            return 2
+        watchlist = list(settings.watchlist or settings.symbols)
+        runtime_watchlist = runtime.get("pair_whitelist")
+        if not isinstance(runtime_watchlist, (list, tuple)):
+            exchange = runtime.get("exchange")
+            runtime_watchlist = (
+                exchange.get("pair_whitelist") if isinstance(exchange, dict) else None
+            )
+        if not isinstance(runtime_watchlist, (list, tuple)):
+            runtime_watchlist = client.whitelist()
+        missing = (
+            sorted(set(watchlist) - set(runtime_watchlist))
+            if isinstance(runtime_watchlist, (list, tuple))
+            and all(isinstance(pair, str) for pair in runtime_watchlist)
+            else []
+        )
+        if missing:
+            orch.eventlog.log(
+                "PREFLIGHT_WARNING",
+                "",
+                {
+                    "reason": "WATCHLIST_MISMATCH",
+                    "settings": watchlist,
+                    "runtime": list(runtime_watchlist),
+                    "missing": missing,
+                },
+            )
+        publisher = PlanPublisher(
+            orch.store,
+            orch.eventlog,
+            validator=orch.validator,
+            ownership=orch.ownership,
+            settings=settings,
+            price_tick_of=orch._price_tick,
+        )
+        timeframe_ms = TF_MS[settings.timeframe]
+
+        def candle_loader(pair: str):
+            # pair_candles already parses REST JSON through _candles_to_df.
+            # An explicit loader must fail closed: never read adapter files.
+            try:
+                frame = client.pair_candles(
+                    pair, settings.timeframe, publisher.min_closed_candles + 30
+                )
+                if frame is None:
+                    raise ValueError("REST candles unavailable or invalid")
+                now_ms = int(publisher._clock() * 1000)
+                open_ms = frame.index.as_unit("ns").asi8 // 1_000_000
+                frame = frame.loc[open_ms + timeframe_ms <= now_ms]
+                if len(frame) < publisher.min_closed_candles:
+                    raise ValueError(f"insufficient closed candles: {len(frame)}")
+            except Exception as exc:
+                logger.debug("REST candle loader failed for %s: %s", pair, exc)
+                # The cycle returns immediately on None; record the failure here.
+                orch.eventlog.log("DATA_UNAVAILABLE", pair, {"error": str(exc)})
+                return None
+            logger.debug(
+                "REST_CANDLES pair=%s candle_ts_ms=%d closed_candles=%d",
+                pair,
+                int(frame.index[-1].value // 1_000_000),
+                len(frame),
+            )
+            return frame
+
+        cycle = DeterministicCycle(
+            orch,
+            publisher,
+            candle_loader=candle_loader,
+            facts_provider=client.facts,
+            timeframe_s=timeframe_ms // 1000,
+        )
+    svc = AIGridService(orch, interval_s=args.interval, cycle=cycle)
 
     def _handle_signal(signum, frame) -> None:
+        del signum, frame
         svc.stop()
 
     signal.signal(signal.SIGINT, _handle_signal)
@@ -184,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             approved_cfg = json.loads(Path(args.approved).read_text(encoding="utf-8"))
             if not isinstance(approved_cfg, dict):
-                raise ValueError("approved config is not a JSON object")
+                raise TypeError("approved config is not a JSON object")
         except Exception as exc:
             print(f"aigrid.service: cannot load preflight configs: {exc}", file=sys.stderr)
             orch.eventlog.close()

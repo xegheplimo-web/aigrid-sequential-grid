@@ -58,7 +58,9 @@ def test_backtest_insufficient_data_raises(settings):
     bt = GridBacktester(settings, config="C")
     with pytest.raises(ValueError):
         bt.run(
-            "ETH/USDT:USDT", datetime(2026, 10, 10, tzinfo=UTC), datetime(2026, 10, 11, tzinfo=UTC)
+            "ETH/USDT:USDT",
+            datetime(2026, 10, 10, tzinfo=UTC),
+            datetime(2026, 10, 11, tzinfo=UTC),
         )
 
 
