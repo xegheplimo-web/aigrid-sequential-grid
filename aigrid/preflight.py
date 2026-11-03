@@ -38,13 +38,14 @@ import secrets
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 FT_API_URL_ENV = "FT_API_URL"
 FT_API_USER_ENV = "FT_API_USER"
-FT_API_PASS_ENV = "FT_API_PASS"
+FT_API_PASS_ENV = "FT_API_PASS"  # nosec B105 -- environment variable name only
 APPROVED_CONFIG_ENV = "AIGRID_APPROVED_CONFIG"
 DEFAULT_API_URL = "http://127.0.0.1:8080"
 DEFAULT_TIMEOUT_S = 10.0
@@ -330,11 +331,13 @@ def _fmt(value) -> str:
 
 # ------------------------------------------------------------------ CLI
 def _get_json(url: str, username: str | None, password: str | None, timeout: float) -> dict:
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise ValueError(f"refusing non-HTTP URL: {url!r}")
     req = urllib.request.Request(url)
     if username:
         token = base64.b64encode(f"{username}:{password or ''}".encode()).decode()
         req.add_header("Authorization", f"Basic {token}")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- HTTP(S) checked above
         return json.loads(resp.read().decode("utf-8"))
 
 

@@ -242,8 +242,8 @@ class TradingAgentsAdapter:
                     if env_file.exists():
                         load_dotenv(env_file, override=False)
                         break
-            except Exception:
-                pass
+            except Exception as exc:  # .env is optional
+                logger.debug("ignoring unreadable .env: %r", exc)
         if key_env and not os.environ.get(key_env):
             self._init_error = f"MISSING_API_KEY:{key_env}"
             logger.warning("AI disabled: %s not set", key_env)

@@ -868,7 +868,7 @@ class AIGridOrchestrator:
                 self.eventlog.log(
                     "AI_ANALYSIS_FAILED", pair, {"error": f"{type(exc).__name__}:{exc}"}
                 )
-            except Exception:
+            except Exception:  # nosec B110 -- best-effort event logging during shutdown
                 pass  # eventlog may already be closed
             return {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
 
@@ -1158,8 +1158,8 @@ class AIGridOrchestrator:
         if fut is not None and not fut.done():
             try:
                 fut.result(timeout=timeout_s)
-            except Exception:
-                pass  # bounded join; never hang
+            except Exception as exc:  # bounded join; never hang
+                logger.debug("AI worker did not finish within %.1fs: %r", timeout_s, exc)
 
 
 def _mk_request(pair: str, trigger: TriggerKind, history_df) -> AnalysisRequest:
