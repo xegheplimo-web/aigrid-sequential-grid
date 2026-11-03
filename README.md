@@ -74,16 +74,23 @@ optional.
 # Hermetic unit suite — no network, no market data, ~3s
 pytest -q
 
-# Fetch a small slice of public Binance futures candles, then replay it
-python scripts/fetch_fixtures.py --pairs 3 --candles 1500
-pytest -q
+# Replay tier: needs the original recordings (opt-in, see tests/conftest.py)
+AIGRID_FULL_FIXTURES=1 pytest -q
+
+# Live-data smoke test against public Binance futures endpoints
+AIGRID_LIVE_DATA=1 pytest -q tests/integration
 
 # Compare a running Freqtrade instance against a reviewed baseline (read-only)
 export FT_API_URL=http://127.0.0.1:8087
 export FT_API_USER=... FT_API_PASS=...
-export AIGRID_APPROVED_CONFIG=configs/approved_baseline.json
+export AIGRID_APPROVED_CONFIG=configs/approved_baseline.example.json
 aigrid-preflight            # exit 0 = match, 1 = drift, 3 = unverifiable
 ```
+
+`scripts/fetch_fixtures.py` downloads a compatible candle slice from the public
+`fapi.binance.com` klines endpoint (no API key). Note that Binance answers
+**HTTP 451** to US-hosted IP ranges, so CI runners in the US cannot fetch it —
+that job is marked best-effort and the hermetic suite remains the gate.
 
 ## Safety model
 

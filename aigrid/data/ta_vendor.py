@@ -33,6 +33,7 @@ _REGISTERED = False
 
 # The timeframe served to the analyst for the current run (set per analysis).
 _CURRENT_TF: str = "15m"
+_ADAPTERS: dict[str, BinanceFuturesDataAdapter] = {}
 _TF_LOCK = threading.Lock()
 
 
@@ -50,14 +51,13 @@ def get_served_timeframe() -> str:
 
 
 def _adapter_for(data_dir: Path) -> BinanceFuturesDataAdapter:
-    # One adapter per data_dir, cached on the module (read-only, cheap).
-    global _ADAPTERS
-    try:
-        return _ADAPTERS[str(data_dir)]
-    except (NameError, KeyError):
-        adapters = globals().setdefault("_ADAPTERS", {})
-        adapters[str(data_dir)] = BinanceFuturesDataAdapter(data_dir)
-        return adapters[str(data_dir)]
+    """One adapter per data_dir, cached on the module (read-only, cheap)."""
+    key = str(data_dir)
+    adapter = _ADAPTERS.get(key)
+    if adapter is None:
+        adapter = BinanceFuturesDataAdapter(data_dir)
+        _ADAPTERS[key] = adapter
+    return adapter
 
 
 def _symbol_to_pair(symbol: str) -> str:

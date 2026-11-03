@@ -890,6 +890,7 @@ class AIGridOrchestrator:
             else:
                 ai_status = "UNAVAILABLE"
         engine_dict = engine.to_dict(candle["close"]) if engine else {}
+        pending_plan = self._pending.get(pair)
         sel = self._last_selection
         return OrchestratorSnapshot(
             ts_ms=now_ms,
@@ -906,7 +907,7 @@ class AIGridOrchestrator:
             ai_reasoning=assessment.reasoning_summary if assessment else "",
             engine=engine_dict,
             risk_events=tuple(risk_events),
-            pending_plan_id=(self._pending.get(pair).plan_id if self._pending.get(pair) else None),
+            pending_plan_id=pending_plan.plan_id if pending_plan else None,
             selection={
                 "candidates": sel.top_pairs if sel else [],
                 "as_of_ms": sel.as_of_ms if sel else 0,
